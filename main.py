@@ -9,12 +9,56 @@ import sys
 import threading
 import traceback
 import queue
+import json
 from queue import Queue
 from dotenv import load_dotenv
 from pathlib import Path
 import serial
 import serial.tools.list_ports
 from datetime import datetime
+
+# QR Code parse program
+def _parse_qr_payload(raw: str):
+    """
+    Parse string QR menjadi dict peserta.
+    Format: JSON / key=value / angka saja.
+    Return dict {id, name, age, gender} atau None jika gagal.
+    """
+    raw = raw.strip()
+    if raw.startswith("{"):
+        try:
+            return _normalize_qr(json.loads(raw))
+        except Exception:
+            pass
+    if "=" in raw:
+        try:
+            pairs = {}
+            for part in raw.replace(",", ";").split(";"):
+                part = part.strip()
+                if "=" in part:
+                    k, v = part.split("=", 1)
+                    pairs[k.strip().lower()] = v.strip()
+            if pairs:
+                return _normalize_qr(pairs)
+        except Exception:
+            pass
+    if raw.isdigit():
+        return {"id": int(raw), "name": "", "age": None, "gender": ""}
+    return None
+
+def _normalize_qr(data: dict) -> dict:
+    id_val   = data.get("id") or data.get("participant_id") or data.get("uid")
+    name_val = data.get("name") or data.get("nama") or ""
+    age_val  = data.get("age")  or data.get("usia")
+    gen_val  = (data.get("gender") or data.get("jenis_kelamin") or "").lower()
+    try:    id_val  = int(id_val)  if id_val  is not None else None
+    except: id_val  = None
+    try:    age_val = int(age_val) if age_val is not None else None
+    except: age_val = None
+    if gen_val in ("laki-laki", "l", "m", "male"):     gen_val = "male"
+    elif gen_val in ("perempuan", "p", "f", "female"): gen_val = "female"
+    else: gen_val = ""
+    return {"id": id_val, "name": str(name_val), "age": age_val, "gender": gen_val}
 
  # Load environment variables from .env file
 env_path = Path('.') / '.env'
@@ -1054,7 +1098,196 @@ class MyTextboxFrame(customtkinter.CTkFrame):
     def bind_return(self, callback):
         self.textbox.bind("<Return>", lambda e: callback())
 
+# ─────────────────────────────────────────────────────────────────────────────
+#  QR Scanner Window (modal, pakai kamera yang sama dengan preview)
+# ─────────────────────────────────────────────────────────────────────────────
 
+class _QRScannerWindow(customtkinter.CTkToplevel):
+    """
+    Pop-up modal untuk scan QR Code via kamera.
+    Setelah QR berhasil dibaca, window tutup otomatis.
+    Akses hasil via self.result (dict) dan self.last_raw (str).
+    """
+
+    def __init__(self, master=None):
+        super().__init__(master)
+        self.result: dict | None = None
+        self.last_raw: str = ""
+        self._running   = False
+        self._last_raw_ts = 0.0   # debounce timestamp
+
+        self.title("Scan QR Code — Block Design Test")
+        self.geometry("520x540")
+        self.resizable(False, False)
+        self.configure(fg_color=_CLR_BG)
+        self.grab_set()  # modal
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+
+        self._build_ui()
+        self.after(120, self._start_scan)
+
+    # ── UI ────────────────────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(1, weight=1)
+
+        # Header
+        hdr = customtkinter.CTkFrame(self, fg_color=_CLR_CARD, corner_radius=0, height=60)
+        hdr.grid(row=0, column=0, sticky="ew")
+        hdr.grid_propagate(False)
+        hdr.grid_columnconfigure(0, weight=1)
+
+        strip = customtkinter.CTkFrame(hdr, fg_color=_CLR_ACCENT, height=3, corner_radius=0)
+        strip.pack(fill="x", side="top")
+
+        customtkinter.CTkLabel(
+            hdr, text="◉  SCAN QR CODE PESERTA",
+            font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_TEXT,
+        ).pack(pady=(8, 2))
+
+        customtkinter.CTkLabel(
+            hdr, text="Arahkan QR ke kamera — data otomatis terisi",
+            font=(_FONT_PRIMARY[0], 10), text_color=_CLR_MUTED,
+        ).pack()
+
+        # Kamera feed
+        cam_frame = customtkinter.CTkFrame(
+            self, fg_color="#111111", corner_radius=_CORNER_RADIUS,
+            border_width=2, border_color=_CLR_SUBTLE_BORDER,
+        )
+        cam_frame.grid(row=1, column=0, sticky="nsew", padx=16, pady=(14, 6))
+        cam_frame.grid_columnconfigure(0, weight=1)
+        cam_frame.grid_rowconfigure(0, weight=1)
+
+        self._cam_lbl = customtkinter.CTkLabel(
+            cam_frame, text="Menginisialisasi kamera...",
+            font=(_FONT_PRIMARY[0], 12), text_color=_CLR_MUTED,
+        )
+        self._cam_lbl.grid(row=0, column=0, sticky="nsew")
+
+        # Status
+        self._status_lbl = customtkinter.CTkLabel(
+            self, text="Menunggu QR...",
+            font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED,
+        )
+        self._status_lbl.grid(row=2, column=0, pady=(0, 2))
+
+        # Tombol tutup
+        ftr = customtkinter.CTkFrame(self, fg_color=_CLR_CARD, corner_radius=0, height=56)
+        ftr.grid(row=3, column=0, sticky="ew")
+        ftr.grid_propagate(False)
+        ftr.grid_columnconfigure(0, weight=1)
+
+        customtkinter.CTkButton(
+            ftr, text="✕  Tutup",
+            command=self._on_close,
+            font=(_FONT_PRIMARY[0], 12),
+            height=36, corner_radius=_CORNER_RADIUS,
+            fg_color=_CLR_SUBTLE_BORDER, hover_color=_CLR_MUTED,
+            text_color=_CLR_TEXT,
+        ).grid(row=0, column=0, padx=24, pady=10, sticky="ew")
+
+    def _set_status(self, text: str, color: str = None):
+        self._status_lbl.configure(text=text, text_color=color or _CLR_MUTED)
+
+    # ── Scan loop ─────────────────────────────────────────────────────────────
+
+    def _start_scan(self):
+        global cap
+        if cap is None or not cap.isOpened():
+            self._set_status("⚠  Kamera tidak tersedia", _CLR_DANGER)
+            return
+        self._running = True
+        self._scan_loop()
+
+    def _scan_loop(self):
+        if not self._running:
+            return
+
+        global cap
+        if cap is None or not cap.isOpened():
+            self.after(200, self._scan_loop)
+            return
+
+        ret, frame = cap.read()
+        if not ret or frame is None:
+            self.after(50, self._scan_loop)
+            return
+
+        # Mirror sesuai setting
+        if CAMERA_MIRROR_X:
+            frame = cv2.flip(frame, 1)
+        if CAMERA_MIRROR_Y:
+            frame = cv2.flip(frame, 0)
+
+        # Decode QR
+        detector = cv2.QRCodeDetector()
+        raw, points, _ = detector.detectAndDecode(frame)
+
+        if raw and points is not None:
+            # Gambar kotak hijau di sekitar QR
+            import numpy as np
+            pts = points.astype(int).reshape(-1, 2)
+            for i in range(len(pts)):
+                cv2.line(frame, tuple(pts[i]), tuple(pts[(i + 1) % len(pts)]),
+                         (0, 220, 80), 3, cv2.LINE_AA)
+
+            now = time.time()
+            if raw != self.last_raw or (now - self._last_raw_ts) > 3.0:
+                self.last_raw      = raw
+                self._last_raw_ts  = now
+                self._on_qr_found(raw)
+
+        else:
+            self._set_status("Menunggu QR...", _CLR_MUTED)
+
+        # Update preview
+        self._update_preview(frame)
+        self.after(30, self._scan_loop)
+
+    def _update_preview(self, frame):
+        w = self._cam_lbl.winfo_width()
+        h = self._cam_lbl.winfo_height()
+        if w < 10 or h < 10:
+            w, h = 460, 320
+        fh, fw = frame.shape[:2]
+        scale  = min(w / fw, h / fh)
+        nw, nh = int(fw * scale), int(fh * scale)
+        resized   = cv2.resize(frame, (nw, nh))
+        rgb       = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+        pil_img   = Image.fromarray(rgb)
+        tk_img    = ImageTk.PhotoImage(image=pil_img)
+        self._cam_lbl.imgtk = tk_img
+        self._cam_lbl.configure(image=tk_img, text="")
+
+    # ── QR ditemukan ──────────────────────────────────────────────────────────
+
+    def _on_qr_found(self, raw: str):
+        parsed = _parse_qr_payload(raw)
+        if parsed is None:
+            self._set_status(f"⚠  Format QR tidak dikenali", _CLR_DANGER)
+            print(f"[QR] WARN: payload tidak bisa diparse → {raw!r}")
+            return
+
+        name_disp = parsed.get("name") or f"ID {parsed.get('id', '?')}"
+        self._set_status(f"✓  Ditemukan: {name_disp}", _CLR_SUCCESS)
+
+        self.result = parsed
+        self.after(700, self._finish)
+
+    def _finish(self):
+        self._running = False
+        self.grab_release()
+        self.destroy()
+
+    def _on_close(self):
+        self._running = False
+        self.grab_release()
+        self.destroy()
+
+
+# Registration Window
 class App_Input(customtkinter.CTk): #CTkToplevel
     def __init__(self):
         super().__init__()
@@ -1110,6 +1343,46 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             r = row[0]
             row[0] += 1
             return r
+        
+        # ── SCAN QR CODE — di paling atas form ─────────────────────────────
+        qr_card = customtkinter.CTkFrame(
+            self._scroll, fg_color=_CLR_CARD, corner_radius=_CORNER_RADIUS,
+            border_width=2, border_color=_CLR_ACCENT,
+        )
+        qr_card.grid(row=next_row(), column=0, sticky="ew", padx=sx, pady=(16, 0))
+        qr_card.grid_columnconfigure(0, weight=1)
+
+        qr_hdr = customtkinter.CTkFrame(qr_card, fg_color="transparent")
+        qr_hdr.grid(row=0, column=0, sticky="ew", padx=14, pady=(12, 4))
+        qr_hdr.grid_columnconfigure(0, weight=1)
+
+        customtkinter.CTkLabel(
+            qr_hdr, text="SCAN QR CODE",
+            font=(_FONT_PRIMARY[0], 14, "bold"), text_color=_CLR_ACCENT,
+        ).grid(row=0, column=0, sticky="w")
+
+        customtkinter.CTkLabel(
+            qr_hdr,
+            text="Alternatif input data peserta dari database",
+            font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED,
+        ).grid(row=1, column=0, sticky="w")
+
+        self.qr_scan_btn = customtkinter.CTkButton(
+            qr_card,
+            text="⬛  Buka Scanner QR",
+            command=self._open_qr_scanner,
+            font=(_FONT_PRIMARY[0], 14, "bold"),
+            fg_color=_CLR_ACCENT, hover_color=_CLR_ACCENT2,
+            text_color=_CLR_TEXT,
+            corner_radius=_CORNER_RADIUS, height=48,
+        )
+        self.qr_scan_btn.grid(row=1, column=0, sticky="ew", padx=14, pady=(4, 6))
+
+        self.qr_status = customtkinter.CTkLabel(
+            qr_card, text="",
+            font=(_FONT_PRIMARY[0], 11), text_color=_CLR_MUTED,
+        )
+        self.qr_status.grid(row=2, column=0, sticky="w", padx=14, pady=(0, 10))
 
         # ── UID Section ──────────────────────────────────────────────────────
         customtkinter.CTkLabel(
@@ -1368,6 +1641,71 @@ class App_Input(customtkinter.CTk): #CTkToplevel
             self.button.configure(text="Mulai Latihan")
         else:
             self._uid_required = True
+
+    # Buka window qr scanner
+    def _open_qr_scanner(self):
+        """Buka QR scanner window — hasil auto-fill UID + data peserta."""
+        self.qr_scan_btn.configure(state="disabled", text="⬛  Membuka kamera...")
+        self.qr_status.configure(text="", text_color=_CLR_MUTED)
+        self.update()
+
+        win = _QRScannerWindow(master=self)
+        self.wait_window(win)
+
+        self.qr_scan_btn.configure(state="normal", text="⬛  Buka Scanner QR")
+
+        result = win.result
+        if result is None:
+            self.qr_status.configure(text="Scanner ditutup tanpa hasil.", text_color=_CLR_MUTED)
+            print("[QR] Scan dibatalkan oleh user.")
+            return
+
+        print(f"[QR] Raw payload  : {win.last_raw!r}")
+        print(f"[QR] Parsed result: {result}")
+
+        # ── Auto-fill globals & UI ──────────────────────────────────────────
+        global current_participant_uid, nick_name, gender_code, age_range_code
+
+        qr_id   = result.get("id")
+        qr_name = result.get("name", "")
+        qr_age  = result.get("age")
+        qr_gen  = result.get("gender", "")
+
+        if qr_id is not None:
+            current_participant_uid = str(qr_id)
+            self.textbox_frame_uid.set_text(str(qr_id))
+        if qr_name:
+            nick_name = qr_name
+        if qr_age is not None:
+            age_range_code = qr_age
+        if qr_gen:
+            gender_code = qr_gen
+
+        age_disp    = str(qr_age) + " th" if qr_age else "?"
+        gender_disp = qr_gen if qr_gen else "?"
+        name_disp   = qr_name if qr_name else (f"ID {qr_id}" if qr_id else "?")
+
+        self.participant_info.configure(
+            text=f"{name_disp}  |  {age_disp}  |  {gender_disp}",
+            text_color=_CLR_TEXT,
+        )
+        self.info_box.grid()
+        self.qr_status.configure(
+            text=f"✓  QR berhasil dibaca: {name_disp}",
+            text_color=_CLR_SUCCESS,
+        )
+        self.uid_status.configure(text="Data dari QR — siap mulai", text_color=_CLR_SUCCESS)
+
+        if PC_MODE == "competition" and qr_id is not None:
+            self.button.grid_remove()
+            self.mode_frame.grid()
+            self.duel_btn.configure(state="normal")
+            self.tournament_btn.configure(state="disabled", fg_color=_CLR_SUBTLE_BORDER)
+
+        self.qr_scan_btn.configure(fg_color=_CLR_SUCCESS, text="✓  QR Berhasil!")
+        self.after(1800, lambda: self.qr_scan_btn.configure(
+            fg_color=_CLR_ACCENT, text="⬛  Buka Scanner QR"
+        ))
 
     def _on_close(self):
         self._preview_running = False
